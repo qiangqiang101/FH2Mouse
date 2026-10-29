@@ -1843,7 +1843,7 @@ FH2MOD_EXPORT int fh2mod_init(const FH2ModApi* api) {
     info.size             = sizeof info;
     info.name             = "FH2Mouse";
     info.version          = FH2MOUSE_VERSION;
-    info.github_repo      = nullptr;
+    info.github_repo      = "qiangqiang101/FH2Mouse";
     info.platform_version = FH2MOD_PLATFORM_VERSION;
     info.check_updates    = 1;
     g_mod                 = api->register_mod(&info);
