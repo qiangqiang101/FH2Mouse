@@ -1,0 +1,92 @@
+name: Build
+
+# Builds FH2Mouse only when asked:
+#   - publishing a release builds it and attaches FH2Mouse-<tag>.zip to that release
+#   - "Run workflow" on the Actions tab builds it and uploads the zip as an artifact
+#
+# The zip ships the FH2 Mod Platform as DWrite.dll only. Azimuth 1.0.3 no longer loads
+# d3dcompiler_47.dll, so that copy is left out.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      LLVM_MINGW_VERSION: "20260922"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Install llvm-mingw + ninja
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends ninja-build
+          curl -fsSL "https://github.com/mstorsjo/llvm-mingw/releases/download/${LLVM_MINGW_VERSION}/llvm-mingw-${LLVM_MINGW_VERSION}-ucrt-ubuntu-22.04-x86_64.tar.xz" -o llvm-mingw.tar.xz
+          sudo mkdir -p /opt/llvm-mingw
+          sudo tar -xJf llvm-mingw.tar.xz -C /opt/llvm-mingw --strip-components=1
+
+      - name: Name the build
+        id: name
+        run: |
+          # The version in CMakeLists.txt is what the mod reports; a release tag has to match it.
+          version=$(sed -n 's/^project([^ ]* VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          echo "CMakeLists.txt version: $version"
+          if [[ "$GITHUB_EVENT_NAME" == "release" ]]; then
+            tag="${GITHUB_REF_NAME#[vV]}"
+            if [[ "$tag" != "$version" ]]; then
+              echo "::error::Release tag $GITHUB_REF_NAME doesn't match VERSION $version in CMakeLists.txt; bump it first."
+              exit 1
+            fi
+            echo "name=FH2Mouse-${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=FH2Mouse-v${version}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=platform/cmake/mingw-w64-x86_64.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Stage the zip's contents
+        run: |
+          # Extracted into the Azimuth folder (next to azimuth.exe):
+          #   DWrite.dll                 the FH2 Mod Platform
+          #   fh2-mods/FH2Mouse.dll      this mod
+          set -e
+          mkdir -p dist/fh2-mods
+          cp build/platform/DWrite.dll dist/
+          cp build/FH2Mouse.dll dist/fh2-mods/
+          cp platform/third_party/minhook/LICENSE.txt dist/LICENSE-MinHook.txt   # the platform includes MinHook
+          cp LICENSE dist/LICENSE.txt
+          cp README.md dist/README.md
+          if [ -e dist/d3dcompiler_47.dll ]; then echo "::error::d3dcompiler_47.dll must not ship"; exit 1; fi
+          (cd dist && find . -type f | sort)
+
+      - name: Zip
+        run: cd dist && zip -r -9 "../${{ steps.name.outputs.name }}.zip" .
+
+      - name: Upload as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" "${{ steps.name.outputs.name }}.zip" --repo "$GITHUB_REPOSITORY" --clobber
+
+    permissions:
+      contents: write   # attaching the zip to the release
