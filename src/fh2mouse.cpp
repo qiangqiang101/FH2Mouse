@@ -158,6 +158,7 @@ struct Settings {
     bool hover_focus  = true;
     DWORD hide_ms     = 3000;   // the cursor hides this long after the mouse last moved (0: never)
     bool debug        = false;  // log what's under the cursor
+    int frame_rate    = 0;      // the game's frame rate, if measuring it goes wrong (0: measure)
 } g_cfg;
 
 std::wstring g_dir;
@@ -183,6 +184,10 @@ void load_settings() {
             "; Hide the cursor after this many seconds without moving the mouse (0 = never).\r\n"
             "HideAfterSeconds=3\r\n"
             "\r\n"
+            "; The game's frame rate. 0 = measure it (the log says what it found). Set it (30, 60,\r\n"
+            "; 120, 144...) only if photo mode or the garage camera turns too fast or too slow.\r\n"
+            "FrameRate=0\r\n"
+            "\r\n"
             "; Log what is under the cursor to fh2-mods\\platform.log.\r\n"
             "Debug=0\r\n";
         HANDLE f = CreateFileW(ini.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -196,6 +201,7 @@ void load_settings() {
     g_cfg.hover_focus = GetPrivateProfileIntW(L"Mouse", L"HoverSelects", 1, ini.c_str()) != 0;
     g_cfg.hide_ms     = GetPrivateProfileIntW(L"Mouse", L"HideAfterSeconds", 3, ini.c_str()) * 1000u;
     g_cfg.debug       = GetPrivateProfileIntW(L"Mouse", L"Debug", 0, ini.c_str()) != 0;
+    g_cfg.frame_rate  = std::min(1000, static_cast<int>(GetPrivateProfileIntW(L"Mouse", L"FrameRate", 0, ini.c_str())));
 }
 
 void logf(const char* fmt, ...) {
@@ -223,10 +229,32 @@ std::atomic<int> g_cx{-1}, g_cy{-1};       // the cursor, in client pixels
 std::atomic<DWORD> g_last_move{0};          // GetTickCount of the last real movement
 std::atomic<DWORD> g_last_frame{0};         // GetTickCount of the last UI frame
 std::atomic<bool> g_framed{false};          // a UI frame has run (the game is up)
+float g_ui_dt = 1.f / 30;                   // the last UI frame's length, in seconds (UI thread)
 std::atomic<bool> g_shown{false};           // what the window was last told
 HCURSOR g_arrow = nullptr;
 
 bool game_active() { return g_framed.load() && GetTickCount() - g_last_frame.load() < 1000; }
+
+// The game runs at whatever frame rate Azimuth or a patch sets. What's done each frame (mouse
+// movement as stick values, waits for the menus) was tuned at 120, and is scaled to the frame's
+// real length.
+constexpr float kTunedDt = 1.f / 120;
+constexpr float frames(int n) { return n * kTunedDt; }   // n frames at 120 a second, in seconds
+
+// The time since the last call, in seconds (kept within 1/1000 .. 1/10 s), or one frame at
+// FrameRate when that's set.
+struct FrameClock {
+    LARGE_INTEGER last{};
+    float tick() {
+        LARGE_INTEGER now, f;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&f);
+        const float s = last.QuadPart ? static_cast<float>(now.QuadPart - last.QuadPart) / f.QuadPart : 1.f / 30;
+        last = now;
+        if (g_cfg.frame_rate > 0) return 1.f / g_cfg.frame_rate;
+        return std::max(0.001f, std::min(0.1f, s));
+    }
+};
 
 bool cursor_wanted() {
     if (!g_cfg.enabled || !game_active() || !g_last_move.load()) return false;
@@ -399,18 +427,18 @@ void send_key_now(int key, bool up) {
 struct KeyEvent {
     int key;
     bool up;
-    int wait;   // frames to wait before this one
+    float wait;   // seconds to wait before this one (at least a frame, if any)
 };
 std::vector<KeyEvent> g_keys;   // UI thread only
 
-void send_key(int key, bool up, int wait = 0) {
+void send_key(int key, bool up, float wait = 0) {
     if (g_keys.size() < 64) g_keys.push_back({key, up, wait});
 }
 
 void flush_one_key() {
     if (g_keys.empty()) return;
     if (g_keys.front().wait > 0) {
-        --g_keys.front().wait;
+        g_keys.front().wait -= g_ui_dt;
         return;
     }
     const KeyEvent k = g_keys.front();
@@ -855,7 +883,7 @@ bool tab_click(uint8_t* ctl) {
     }
     if (g_cfg.debug) logf("tab click: %d x %s", steps, key == KEY_RB ? "RB" : "LB");
     for (int i = 0; i < steps; ++i) {
-        send_key(key, false, i ? 10 : 0);   // a moment for each tab to come in
+        send_key(key, false, i ? frames(10) : 0);   // a moment for each tab to come in
         send_key(key, true);
     }
     return true;
@@ -964,7 +992,7 @@ bool map_release() {
     if (!c || g_map_dragged) return true;
     map_point(c);
     if (g_cfg.debug) logf("map click at (%.0f,%.0f), zoom %.1f (%.2f)", g_map_start[0], g_map_start[1], f32(c, MAP_ZOOM_SHOWN), f32(c, MAP_ZOOM));
-    send_key(KEY_A, false, 1);
+    send_key(KEY_A, false, frames(1));
     send_key(KEY_A, true);
     return true;
 }
@@ -1144,7 +1172,7 @@ bool item_center_in(uint8_t* v, uint8_t* item, uint8_t* root, float c[2], int de
     return false;
 }
 
-void tap(int key, int wait = 0) {
+void tap(int key, float wait = 0) {
     send_key(key, false, wait);
     send_key(key, true);
 }
@@ -1154,7 +1182,8 @@ struct Walk {
     uint8_t* sel = nullptr;
     uint8_t* item = nullptr;
     float pt[2] = {};
-    int steps = 0, stalls = 0, wait = 0;
+    int steps = 0, stalls = 0;
+    float wait = 0;   // seconds
     uint8_t* last = nullptr;
     bool bumpers = false;   // LB/RB instead of left/right
     int dx = 0, dy = 0;     // the last direction
@@ -1168,7 +1197,7 @@ void walk_stop(const char* why) {
 void walk_step() {
     if (!g_walk.active || !g_keys.empty()) return;
     if (g_walk.wait > 0) {
-        --g_walk.wait;
+        g_walk.wait -= g_ui_dt;
         return;
     }
     // Still there? The same selector under the same spot (what's in it may have scrolled).
@@ -1201,7 +1230,7 @@ void walk_step() {
     else key = g_walk.dy > 0 ? KEY_DOWN : KEY_UP;
     tap(key);
     g_walk.last = cur;
-    g_walk.wait = 8;
+    g_walk.wait = frames(8);
     if (++g_walk.steps > 40) walk_stop("too far");
 }
 
@@ -1254,7 +1283,7 @@ PhotoInputFn o_photo_input = nullptr;
 
 // Mouse movement for the camera, in UI pixels, gathered on the UI thread and used up by the camera.
 std::atomic<float> g_photo_look_x{0}, g_photo_look_y{0}, g_photo_move_x{0}, g_photo_move_y{0};
-std::atomic<int> g_photo_zoom{0};   // camera frames left to zoom in (+) or out (-), from the wheel
+std::atomic<float> g_photo_zoom{0};   // seconds left to zoom in (+) or out (-), from the wheel
 
 float take(std::atomic<float>& a) { return a.exchange(0.f); }
 
@@ -1277,11 +1306,17 @@ void photo_input(void* cam) {
     auto* c = static_cast<uint8_t*>(cam);
     const float lx = take(g_photo_look_x), ly = take(g_photo_look_y);
     const float mx = take(g_photo_move_x), my = take(g_photo_move_y);
-    int z = g_photo_zoom.load();
-    const float zoom = z > 0 ? 1.f : z < 0 ? -1.f : 0.f;
-    if (z) g_photo_zoom.compare_exchange_strong(z, z > 0 ? z - 1 : z + 1);
-    if (lx || ly) f32(c, PHOTO_LOOK_X) -= stick(lx, 0.05f), f32(c, PHOTO_LOOK_Y) -= stick(ly, 0.05f);
-    if (mx || my) f32(c, PHOTO_MOVE_X) -= stick(mx, 0.05f), f32(c, PHOTO_MOVE_Y) -= stick(my, 0.05f);
+    static FrameClock clock;
+    const float dt = clock.tick(), k = 0.05f * kTunedDt / dt;
+    // The wheel's zoom, held for its time: the last frame of it only partly.
+    float z = g_photo_zoom.load(), zoom = 0;
+    if (z) {
+        const float step = std::min(std::abs(z), dt);
+        zoom = (z > 0 ? 1 : -1) * step / dt;
+        if (!g_photo_zoom.compare_exchange_strong(z, z > 0 ? z - step : z + step)) zoom = 0;
+    }
+    if (lx || ly) f32(c, PHOTO_LOOK_X) -= stick(lx, k), f32(c, PHOTO_LOOK_Y) -= stick(ly, k);
+    if (mx || my) f32(c, PHOTO_MOVE_X) -= stick(mx, k), f32(c, PHOTO_MOVE_Y) -= stick(my, k);
     if (zoom) f32(c, PHOTO_ZOOM) += zoom;
     if (g_photo_keys.load()) {
         f32(c, PHOTO_MOVE_X) += key_axis('S', 'W');   // 0x1F0 is forward/back
@@ -1341,7 +1376,7 @@ bool photo_release() {
 
 bool photo_wheel(int delta) {
     if (!in_photo_mode()) return false;
-    g_photo_zoom += 10 * delta / WHEEL_DELTA;
+    add(g_photo_zoom, frames(10) * delta / WHEEL_DELTA);
     return true;
 }
 
@@ -1398,8 +1433,9 @@ bool on_move_cam() {
 
 // Before the UI's update: this frame's drag as stick values ("grab and turn the car").
 void cam_frame_begin() {
-    g_cam_stick_x = g_cam_drag ? -g_cam_dx * 0.04f : 0.f;
-    g_cam_stick_y = g_cam_drag ? g_cam_dy * 0.04f : 0.f;
+    const float k = 0.04f * kTunedDt / g_ui_dt;
+    g_cam_stick_x = g_cam_drag ? -g_cam_dx * k : 0.f;
+    g_cam_stick_y = g_cam_drag ? g_cam_dy * k : 0.f;
     g_cam_dx = g_cam_dy = 0;
 }
 
@@ -1741,6 +1777,12 @@ bool frame_guarded() {
 
 void detour_update(void* self, float dt) {
     g_ui = static_cast<uint8_t*>(self);
+    static FrameClock clock;
+    g_ui_dt = clock.tick();
+    static int counted = 0;
+    static float total = 0;
+    if (counted < 600 && ++counted > 300 && (total += g_ui_dt, counted == 600))
+        logf("the menus run at %.0f frames a second%s", 300 / total, g_cfg.frame_rate > 0 ? " (FrameRate is set)" : "");
     press_frame();
     g_last_frame = GetTickCount();
     g_framed     = true;

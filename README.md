@@ -56,6 +56,7 @@ To remove it, delete `fh2-mods\FH2Mouse.dll` and the `FH2Mouse` folder.
 | `Enabled` | `1` | `0` turns the mod off |
 | `HoverSelects` | `1` | Moving over something selects it. With `0`, only clicks do |
 | `HideAfterSeconds` | `3` | Hide the cursor after this long without moving the mouse (`0` = never) |
+| `FrameRate` | `0` | The game's frame rate: `0` measures it (`platform.log` says what it found). Set it (`30`, `60`, `120`, `144`...) only if photo mode or the garage camera turns too fast or too slow |
 | `Debug` | `0` | Log what's under the cursor and every click to `fh2-mods\platform.log` |
 
 ## Known limits
