@@ -110,9 +110,11 @@ constexpr int KEY_LEFT = 23, KEY_RIGHT = 25;
 struct Expect {
     uintptr_t rva;
     uint8_t bytes[12];
+    uint8_t len = sizeof bytes;   // how many of them to compare
 };
 const Expect kExpected[] = {
-    {RVA_UI_UPDATE, {0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0xC5, 0xFA, 0x10, 0x05, 0x12, 0xAD}},
+    // Not the address of its 1/30 s frame cap: frame rate patches point that at their own value.
+    {RVA_UI_UPDATE, {0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0xC5, 0xFA, 0x10, 0x05}, 10},
     {RVA_IS_TYPE, {0x40, 0x57, 0x48, 0x83, 0xEC, 0x50, 0x48, 0xC7, 0x44, 0x24, 0x20, 0xFE}},
     {RVA_FOCUS, {0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B}},
     {RVA_FOCUSED, {0x48, 0x83, 0xEC, 0x28, 0xE8, 0x37, 0x8E, 0xFB, 0xFF, 0x48, 0x8B, 0x88}},
@@ -1761,54 +1763,14 @@ void detour_update(void* self, float dt) {
 
 // ---- start-up -----------------------------------------------------------------------------------
 
-// Where a jump someone else put at the start of a function goes (jmp rel32/rel8, jmp [rip+x],
-// mov rax, imm64; jmp rax), or nullptr if it doesn't start with one.
-const uint8_t* jump_target(const uint8_t* p) {
-    if (p[0] == 0xE9) { int32_t d; std::memcpy(&d, p + 1, 4); return p + 5 + d; }
-    if (p[0] == 0xEB) return p + 2 + static_cast<int8_t>(p[1]);
-    if (p[0] == 0xFF && p[1] == 0x25) {
-        int32_t d; std::memcpy(&d, p + 2, 4);
-        const uint8_t* t; std::memcpy(&t, p + 6 + d, sizeof t); return t;
-    }
-    if (p[0] == 0x48 && p[1] == 0xB8 && p[10] == 0xFF && p[11] == 0xE0) {
-        const uint8_t* t; std::memcpy(&t, p + 2, sizeof t); return t;
-    }
-    return nullptr;
-}
-
-// "name.dll+0x1234" for an address, for the log.
-std::string module_of(const void* addr) {
-    HMODULE m = nullptr;
-    char path[MAX_PATH] = "?";
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (!VirtualQuery(addr, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) return "unmapped memory";
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                            static_cast<LPCSTR>(addr), &m) || !m)
-        return "memory outside any DLL";
-    GetModuleFileNameA(m, path, MAX_PATH);
-    const char* name = std::strrchr(path, '\\');
-    char buf[MAX_PATH + 32];
-    std::snprintf(buf, sizeof buf, "%s+0x%llX", name ? name + 1 : path,
-                  static_cast<unsigned long long>(static_cast<const uint8_t*>(addr) - reinterpret_cast<uint8_t*>(m)));
-    return buf;
-}
-
 bool code_matches() {
     for (const Expect& e : kExpected) {
         const uint8_t* p = g_base + e.rva;
-        if (std::memcmp(p, e.bytes, sizeof e.bytes) == 0) continue;
+        if (std::memcmp(p, e.bytes, e.len) == 0) continue;
         char hex[3 * sizeof e.bytes + 1] = {};
         for (std::size_t i = 0; i < sizeof e.bytes; ++i) std::snprintf(hex + 3 * i, 4, "%02X ", p[i]);
         hex[3 * sizeof e.bytes - 1] = 0;
-        const uint8_t* target = jump_target(p);
-        std::string where = target ? ", a jump into " + module_of(target) : "";
-        // Update is only hooked through its vtable slot, so another tool's detour on its code is fine.
-        if (e.rva == RVA_UI_UPDATE && target) {
-            logf("UserInterface::Update was already hooked by something else (%s); going on", where.c_str() + 2);
-            continue;
-        }
-        logf("game code at +0x%llX isn't as expected (%s%s); not starting", static_cast<unsigned long long>(e.rva), hex,
-             where.c_str());
+        logf("game code at +0x%llX isn't as expected (%s); not starting", static_cast<unsigned long long>(e.rva), hex);
         return false;
     }
     if (at<uint8_t*>(g_base, RVA_UI_UPDATE_SLOT) != g_base + RVA_UI_UPDATE) {
